@@ -7,6 +7,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
+import csv
+import os
+import re
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,6 +19,217 @@ from pyscipopt import Model, quicksum, Eventhdlr, SCIP_EVENTTYPE
 
 # Ensure reproducible initialization
 np.random.seed(42)
+
+def _normalize_header_name(name: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "", name.strip().lower())
+    return cleaned
+
+
+def _unique_headers(headers):
+    seen = {}
+    unique = []
+    for header in headers:
+        base = header or "col"
+        if base not in seen:
+            seen[base] = 1
+            unique.append(base)
+        else:
+            seen[base] += 1
+            unique.append(f"{base}_{seen[base]}")
+    return unique
+
+
+def _reset_log_files(*paths: str | None):
+    for path in paths:
+        if not path:
+            continue
+        try:
+            with open(path, "w"):
+                pass
+        except Exception as exc:
+            print(f"Warning: failed to reset log file {path} ({exc}).")
+
+
+def _extract_number(text: str | None):
+    if text is None:
+        return None
+    stripped = text.strip()
+    if not stripped or stripped in {"-", "--"}:
+        return None
+    lower = stripped.lower()
+    if "inf" in lower or "nan" in lower:
+        return None
+    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", stripped)
+    if not match:
+        return None
+    try:
+        return float(match.group())
+    except ValueError:
+        return None
+
+
+def _parse_time_seconds(text: str | None):
+    number = _extract_number(text)
+    if number is None or text is None:
+        return None
+    lower = text.strip().lower()
+    if lower.endswith("ms"):
+        return number / 1000.0
+    if lower.endswith("s"):
+        return number
+    if lower.endswith("min") or lower.endswith("m"):
+        return number * 60.0
+    if lower.endswith("h"):
+        return number * 3600.0
+    return number
+
+
+def _parse_gap(text: str | None):
+    if text is None:
+        return None, None
+    stripped = text.strip()
+    if not stripped or stripped in {"-", "--"}:
+        return None, None
+    lower = stripped.lower()
+    if "inf" in lower or "nan" in lower:
+        return None, None
+    number = _extract_number(text)
+    if number is None:
+        return None, None
+    if "%" in lower:
+        return number / 100.0, number
+    return number, number * 100.0
+
+
+def _find_key(row, prefixes):
+    for key in row:
+        for prefix in prefixes:
+            if key == prefix or key.startswith(prefix):
+                return key
+    return None
+
+
+def parse_scip_log(log_path: str):
+    rows = []
+    header = None
+
+    if not os.path.exists(log_path):
+        print(f"Log file not found: {log_path}")
+        return header, rows
+
+    with open(log_path, "r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            if "|" not in line:
+                continue
+            parts = [part.strip() for part in line.split("|")]
+            parts = [part for part in parts if part]
+            if not parts:
+                continue
+            lower_parts = [part.lower() for part in parts]
+            if header is None and any("time" in part for part in lower_parts) and any(
+                "gap" in part for part in lower_parts
+            ):
+                normalized = [_normalize_header_name(part) for part in parts]
+                header = _unique_headers(normalized)
+                continue
+
+            if header is None:
+                continue
+            if len(parts) != len(header):
+                continue
+            if not re.search(r"\d", parts[0]):
+                continue
+
+            row = {header[idx]: parts[idx] for idx in range(len(parts))}
+
+            key_time = _find_key(row, ["time"])
+            key_gap = _find_key(row, ["gap"])
+            key_nodes = _find_key(row, ["nodes", "node"])
+            key_primal = _find_key(row, ["primalbound", "primal", "primalbnd"])
+            key_dual = _find_key(row, ["dualbound", "dual", "dualbnd"])
+
+            time_raw = row.get(key_time) if key_time else None
+            gap_raw = row.get(key_gap) if key_gap else None
+            nodes_raw = row.get(key_nodes) if key_nodes else None
+            primal_raw = row.get(key_primal) if key_primal else None
+            dual_raw = row.get(key_dual) if key_dual else None
+
+            gap_rel, gap_percent = _parse_gap(gap_raw)
+
+            row["time_s"] = _parse_time_seconds(time_raw)
+            row["gap_rel"] = gap_rel
+            row["gap_percent"] = gap_percent
+            row["nodes_int"] = (
+                int(_extract_number(nodes_raw)) if nodes_raw is not None else None
+            )
+            row["primal_bound"] = _extract_number(primal_raw)
+            row["dual_bound"] = _extract_number(dual_raw)
+
+            rows.append(row)
+
+    return header, rows
+
+
+def save_scip_log_csv(log_path: str, csv_path: str):
+    header, rows = parse_scip_log(log_path)
+    if not rows:
+        print("No SCIP log rows parsed; CSV not written.")
+        return None
+
+    fieldnames = list(header) if header else []
+    for extra in ["time_s", "gap_rel", "gap_percent", "nodes_int", "primal_bound", "dual_bound"]:
+        if extra not in fieldnames:
+            fieldnames.append(extra)
+
+    with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Saved SCIP log CSV to: {csv_path}")
+    return csv_path
+
+
+def plot_csv_series(
+    csv_path: str, x_col: str = "time_s", y_col: str = "gap_rel", save_path: str | None = None
+):
+    if not os.path.exists(csv_path):
+        print(f"CSV file not found: {csv_path}")
+        return
+
+    xs = []
+    ys = []
+    with open(csv_path, "r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            x_val = _extract_number(row.get(x_col))
+            y_val = _extract_number(row.get(y_col))
+            if x_val is None or y_val is None:
+                continue
+            xs.append(x_val)
+            ys.append(y_val)
+
+    if not xs:
+        print("No numeric data available for plotting.")
+        return
+
+    order = np.argsort(xs)
+    xs = [xs[idx] for idx in order]
+    ys = [ys[idx] for idx in order]
+
+    plt.figure(figsize=(7, 4))
+    plt.plot(xs, ys, marker="o", linewidth=1.5)
+    plt.xlabel(x_col)
+    plt.ylabel(y_col)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    if save_path is None:
+        base_dir = os.path.dirname(os.path.abspath(csv_path))
+        safe_x = re.sub(r"[^a-zA-Z0-9_-]+", "_", x_col.strip())
+        safe_y = re.sub(r"[^a-zA-Z0-9_-]+", "_", y_col.strip())
+        save_path = os.path.join(base_dir, f"plot_{safe_y}_vs_{safe_x}.png")
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    print(f"Saved plot to: {save_path}")
 
 
 class ImprovementStopper(Eventhdlr):
@@ -75,22 +290,35 @@ class CTM_OR_Model:
         w=0.5,
         rho_jam=1.0,
         num_steps=360,
+        total_time_s=None,
         cell_length_m=100.0 / 3.0,
         cell_width_m=15.0,
         intersection_size_m=30.0,
         time_step_s=2.0,
+        min_green_s=5.0,
+        max_green_s=40.0,
         v_mps=50.0 / 3.0,
         w_mps=None,
         use_physical_units=True,
+        boundary_flows=None,
+        boundary_flow_unit="per_second",
+        startup_duration_s=None,
     ):
         self.num_cells = num_cells
         self.rho_jam = rho_jam
         self.num_steps = num_steps
+        if total_time_s is not None:
+            self.num_steps = max(1, int(round(float(total_time_s) / time_step_s)))
+        self.total_time_s = self.num_steps * time_step_s
 
         self.cell_length_m = cell_length_m
         self.cell_width_m = cell_width_m
         self.intersection_size_m = intersection_size_m
         self.time_step_s = time_step_s
+        self.min_green_s = min_green_s
+        self.max_green_s = max_green_s
+        self.boundary_flow_unit = boundary_flow_unit
+        self.startup_duration_s = 6.0 if startup_duration_s is None else float(startup_duration_s)
 
         if use_physical_units:
             if v_mps is None:
@@ -120,13 +348,16 @@ class CTM_OR_Model:
                 [0.6, 0.15, 0.25],
             ]
         )
+        self._validate_turning_ratios()
 
-        self.boundary_flows = {
-            "N": 0.26,
-            "E": 0.28,
-            "S": 0.22,
-            "W": 0.30,
-        }
+        if boundary_flows is None:
+            boundary_flows = {
+                "N": 0.26,
+                "E": 0.28,
+                "S": 0.22,
+                "W": 0.30,
+            }
+        self.boundary_flows = boundary_flows
 
         self.turn_map = {
             "N": {"S": "S", "L": "W", "R": "E"},
@@ -168,7 +399,14 @@ class CTM_OR_Model:
                 self.intersection_size_m,
             )
         )
-        print(f"Cells per direction: {num_cells}, time steps: {num_steps}")
+        print(
+            f"Cells per direction: {num_cells}, time steps: {self.num_steps} "
+            f"(dt={self.time_step_s:.2f} s, total={self.total_time_s:.2f} s)"
+        )
+        if self.v > 1.0 + 1e-9 or self.w > 1.0 + 1e-9:
+            print(
+                "Warning: v or w exceeds 1 cell/step; large time_step_s may violate CFL."
+            )
 
     def define_decision_variables(self):
         print("Defining decision variables...")
@@ -265,6 +503,7 @@ class CTM_OR_Model:
         green_start = {}
         startup_step = {}
         startup_factor = {}
+        step_count = self._startup_step_count()
         for group in self.SIGNAL_GROUPS:
             for t in range(self.num_steps + 1):
                 green_start[(group, t)] = self.model.addVar(
@@ -273,7 +512,7 @@ class CTM_OR_Model:
                 startup_factor[(group, t)] = self.model.addVar(
                     name=f"startup_factor_{group}_{t}", vtype="C", lb=0.0, ub=1.0
                 )
-                for step in range(1, 5):
+                for step in range(1, step_count + 1):
                     startup_step[(group, t, step)] = self.model.addVar(
                         name=f"startup_step_{group}_{step}_{t}", vtype="B"
                     )
@@ -295,6 +534,52 @@ class CTM_OR_Model:
 
     def _startup_profile(self):
         return self.STARTUP_PROFILE
+
+    def _startup_profile_steps(self):
+        base_profile = list(self.STARTUP_PROFILE)
+        if self.startup_duration_s is None:
+            return base_profile
+        transient_steps = max(1, int(math.ceil(self.startup_duration_s / self.time_step_s)))
+        base_transient = np.asarray(base_profile[:-1], dtype=float)
+        if transient_steps == len(base_transient):
+            transient_profile = base_transient
+        else:
+            x_old = np.linspace(1.0, len(base_transient), num=len(base_transient))
+            x_new = np.linspace(1.0, len(base_transient), num=transient_steps)
+            transient_profile = np.interp(x_new, x_old, base_transient)
+        return list(transient_profile) + [float(base_profile[-1])]
+
+    def _startup_step_count(self):
+        return len(self._startup_profile_steps())
+
+    def _boundary_demand_per_step(self, rate):
+        if self.boundary_flow_unit == "per_second":
+            return rate * self.time_step_s
+        if self.boundary_flow_unit == "per_step":
+            return rate
+        raise ValueError(f"Unsupported boundary_flow_unit: {self.boundary_flow_unit}")
+
+    def _turning_ratio(self, from_dir, movement):
+        dir_idx = self.DIRECTION_INDEX[from_dir]
+        move_idx = self.MOVEMENT_INDEX[movement]
+        return float(self.turning_ratios[dir_idx, move_idx])
+
+    def _validate_turning_ratios(self):
+        expected_shape = (len(self.DIRECTIONS), len(self.MOVEMENTS))
+        ratios = np.asarray(self.turning_ratios, dtype=float)
+        if ratios.shape != expected_shape:
+            raise ValueError(
+                f"turning_ratios must have shape {expected_shape}, got {ratios.shape}."
+            )
+        if np.any(ratios < -1e-9):
+            raise ValueError("turning_ratios must be non-negative for all movements.")
+        row_sums = ratios.sum(axis=1)
+        if not np.allclose(row_sums, 1.0, atol=1e-8):
+            raise ValueError(
+                "Each approach turning ratio row must sum to 1.0. "
+                f"Current row sums: {row_sums.tolist()}"
+            )
+        self.turning_ratios = ratios
 
     def _force_flow_min(
         self, flow_var, send_cap, recv_cap, max_cap, name_prefix, max_cap_value=None
@@ -399,7 +684,7 @@ class CTM_OR_Model:
         for t in range(self.num_steps):
             for dir_idx in range(len(self.DIRECTIONS)):
                 from_dir = self.DIRECTIONS[dir_idx]
-                demand = self.boundary_flows[from_dir]
+                demand = self._boundary_demand_per_step(self.boundary_flows[from_dir])
                 f_in = boundary_inflow[(dir_idx, t)]
                 q_in = boundary_queue[(dir_idx, t)]
                 q_next = boundary_queue[(dir_idx, t + 1)]
@@ -608,7 +893,17 @@ class CTM_OR_Model:
         green_start = self.decision_vars["green_start"]
         startup_step = self.decision_vars["startup_step"]
         startup_factor = self.decision_vars["startup_factor"]
-        profile = self._startup_profile()
+        profile = self._startup_profile_steps()
+        step_count = len(profile)
+
+        min_green_steps = max(1, int(math.ceil(self.min_green_s / self.time_step_s)))
+        max_green_steps = max(
+            min_green_steps, int(math.floor(self.max_green_s / self.time_step_s))
+        )
+        if min_green_steps > self.num_steps + 1:
+            raise ValueError(
+                "min_green_s is larger than the available time horizon."
+            )
 
         self.model.addCons(current_phase[0] == 0, name="initial_phase")
         self.model.addCons(phase_switch[0] == 0, name="initial_phase_switch")
@@ -673,76 +968,89 @@ class CTM_OR_Model:
                     )
                     constraint_counter += 3
 
-                step1 = startup_step[(group, t, 1)]
-                step2 = startup_step[(group, t, 2)]
-                step3 = startup_step[(group, t, 3)]
-                step4 = startup_step[(group, t, 4)]
+                step_vars = [
+                    startup_step[(group, t, step)]
+                    for step in range(1, step_count + 1)
+                ]
 
                 self.model.addCons(
-                    step1 == start_var,
+                    step_vars[0] == start_var,
                     name=f"startup_step1_{group}_{constraint_counter}",
                 )
                 constraint_counter += 1
 
-                if t >= 1:
-                    prev_start = green_start[(group, t - 1)]
-                    self.model.addCons(
-                        step2 <= prev_start,
-                        name=f"startup_step2_ub1_{group}_{constraint_counter}",
-                    )
-                    self.model.addCons(
-                        step2 <= green_now,
-                        name=f"startup_step2_ub2_{group}_{constraint_counter}",
-                    )
-                    self.model.addCons(
-                        step2 >= prev_start + green_now - 1,
-                        name=f"startup_step2_lb_{group}_{constraint_counter}",
-                    )
-                    constraint_counter += 3
-                else:
-                    self.model.addCons(
-                        step2 == 0,
-                        name=f"startup_step2_zero_{group}_{constraint_counter}",
-                    )
-                    constraint_counter += 1
-
-                if t >= 2:
-                    prev2_start = green_start[(group, t - 2)]
-                    self.model.addCons(
-                        step3 <= prev2_start,
-                        name=f"startup_step3_ub1_{group}_{constraint_counter}",
-                    )
-                    self.model.addCons(
-                        step3 <= green_now,
-                        name=f"startup_step3_ub2_{group}_{constraint_counter}",
-                    )
-                    self.model.addCons(
-                        step3 >= prev2_start + green_now - 1,
-                        name=f"startup_step3_lb_{group}_{constraint_counter}",
-                    )
-                    constraint_counter += 3
-                else:
-                    self.model.addCons(
-                        step3 == 0,
-                        name=f"startup_step3_zero_{group}_{constraint_counter}",
-                    )
-                    constraint_counter += 1
+                for step_idx in range(2, step_count):
+                    step_var = step_vars[step_idx - 1]
+                    offset = step_idx - 1
+                    if t >= offset:
+                        prev_start = green_start[(group, t - offset)]
+                        self.model.addCons(
+                            step_var <= prev_start,
+                            name=f"startup_step{step_idx}_ub1_{group}_{constraint_counter}",
+                        )
+                        self.model.addCons(
+                            step_var <= green_now,
+                            name=f"startup_step{step_idx}_ub2_{group}_{constraint_counter}",
+                        )
+                        self.model.addCons(
+                            step_var >= prev_start + green_now - 1,
+                            name=f"startup_step{step_idx}_lb_{group}_{constraint_counter}",
+                        )
+                        constraint_counter += 3
+                    else:
+                        self.model.addCons(
+                            step_var == 0,
+                            name=f"startup_step{step_idx}_zero_{group}_{constraint_counter}",
+                        )
+                        constraint_counter += 1
 
                 self.model.addCons(
-                    step1 + step2 + step3 + step4 == green_now,
+                    quicksum(step_vars) == green_now,
                     name=f"startup_step_sum_{group}_{constraint_counter}",
                 )
                 constraint_counter += 1
 
                 self.model.addCons(
                     startup_factor[(group, t)]
-                    == profile[0] * step1
-                    + profile[1] * step2
-                    + profile[2] * step3
-                    + profile[3] * step4,
+                    == quicksum(profile[idx] * step_vars[idx] for idx in range(step_count)),
                     name=f"startup_factor_{group}_{constraint_counter}",
                 )
                 constraint_counter += 1
+
+        def _green_at(group, t):
+            return 1 - current_phase[t] if group == "EW" else current_phase[t]
+
+        max_start = self.num_steps - min_green_steps + 1
+        for t in range(max_start + 1):
+            for group in self.SIGNAL_GROUPS:
+                window = quicksum(_green_at(group, t + k) for k in range(min_green_steps))
+                self.model.addCons(
+                    window >= min_green_steps * green_start[(group, t)],
+                    name=f"min_green_{group}_{constraint_counter}",
+                )
+                constraint_counter += 1
+
+        if max_start + 1 <= self.num_steps:
+            for t in range(max_start + 1, self.num_steps + 1):
+                for group in self.SIGNAL_GROUPS:
+                    self.model.addCons(
+                        green_start[(group, t)] == 0,
+                        name=f"min_green_tail_{group}_{constraint_counter}",
+                    )
+                    constraint_counter += 1
+
+        max_window_start = self.num_steps - max_green_steps
+        if max_window_start >= 0:
+            for t in range(max_window_start + 1):
+                for group in self.SIGNAL_GROUPS:
+                    window = quicksum(
+                        _green_at(group, t + k) for k in range(max_green_steps + 1)
+                    )
+                    self.model.addCons(
+                        window <= max_green_steps,
+                        name=f"max_green_{group}_{constraint_counter}",
+                    )
+                    constraint_counter += 1
 
         for t in range(self.num_steps):
             for from_dir in self.DIRECTIONS:
@@ -761,6 +1069,15 @@ class CTM_OR_Model:
                     flow[(from_dir, self.turn_map[from_dir][movement], movement, t)]
                     for movement in self.MOVEMENTS
                 )
+
+                for movement in self.MOVEMENTS:
+                    to_dir = self.turn_map[from_dir][movement]
+                    ratio = self._turning_ratio(from_dir, movement)
+                    self.model.addCons(
+                        flow[(from_dir, to_dir, movement, t)] == ratio * total_outflow,
+                        name=f"turning_ratio_{from_dir}_{movement}_{t}_{constraint_counter}",
+                    )
+                    constraint_counter += 1
 
                 self.model.addCons(
                     total_outflow <= self.v_crossing * cell_rho,
@@ -868,6 +1185,9 @@ class CTM_OR_Model:
         improve_rel=None,
         improve_chunk_seconds=30,
         improve_max_rounds=10,
+        log_path=None,
+        log_csv_path=None,
+        log_display_freq=1,
     ):
         import time
 
@@ -875,8 +1195,28 @@ class CTM_OR_Model:
         if self.model is None:
             raise ValueError("Model is not initialized. Call build_objective() first.")
 
+        if log_path is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            log_path = os.path.join(script_dir, "scip.log")
+        if log_csv_path is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            log_csv_path = os.path.join(script_dir, "scip_log.csv")
+
+        _reset_log_files(log_path, log_csv_path)
+
         if gap_rel is not None:
             self.model.setParam("limits/gap", gap_rel)
+
+        if log_path:
+            try:
+                self.model.setLogfile(log_path)
+            except Exception as exc:
+                print(f"Warning: failed to set log file ({exc}).")
+            if log_display_freq is not None:
+                try:
+                    self.model.setParam("display/freq", int(log_display_freq))
+                except Exception as exc:
+                    print(f"Warning: failed to set display/freq ({exc}).")
 
         if improve_chunk_seconds is not None and improve_max_rounds is not None:
             total_time = improve_chunk_seconds * improve_max_rounds
@@ -900,6 +1240,15 @@ class CTM_OR_Model:
         start_time = time.time()
         self.model.optimize()
         solve_time = time.time() - start_time
+
+        if log_csv_path and log_path:
+            if os.path.exists(log_path):
+                try:
+                    save_scip_log_csv(log_path, log_csv_path)
+                except Exception as exc:
+                    print(f"Warning: failed to parse log ({exc}).")
+            else:
+                print(f"Warning: log file not found after solve: {log_path}")
 
         status = self.model.getStatus()
         if self.model.getNSols() == 0:
@@ -997,7 +1346,7 @@ class CTM_OR_Model:
             print("No optimized results. Run solve() first.")
             return
 
-        time_steps = np.arange(self.num_steps + 1)
+        time_seconds = np.arange(self.num_steps + 1) * self.time_step_s
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         fig.suptitle(
             f"Key density evolution ({self.objective_type})",
@@ -1010,9 +1359,9 @@ class CTM_OR_Model:
             ax = axes[dir_idx // 2, dir_idx % 2]
             rho_up_last = self.rho_optimized[dir_idx, 0, -1, :]
             rho_down_first = self.rho_optimized[dir_idx, 1, 0, :]
-            ax.plot(time_steps, rho_up_last, "b-", linewidth=2, label="Upstream last")
-            ax.plot(time_steps, rho_down_first, "r-", linewidth=2, label="Downstream first")
-            ax.set_xlabel("Time step")
+            ax.plot(time_seconds, rho_up_last, "b-", linewidth=2, label="Upstream last")
+            ax.plot(time_seconds, rho_down_first, "r-", linewidth=2, label="Downstream first")
+            ax.set_xlabel("Time (s)")
             ax.set_ylabel("Density")
             ax.set_title(direction_names[dir_idx], fontweight="bold")
             ax.legend()
@@ -1029,7 +1378,8 @@ class CTM_OR_Model:
             print("No signal phase data available for plotting.")
             return
 
-        time_axis = np.arange(len(self.signal_phase))
+        num_phases = len(self.signal_phase)
+        time_edges = np.arange(num_phases + 1) * self.time_step_s
         ew_signal = [1 - p for p in self.signal_phase]
         ns_signal = [p for p in self.signal_phase]
 
@@ -1040,7 +1390,7 @@ class CTM_OR_Model:
         grid = np.vstack([ew_signal, ns_signal])
         cmap = ListedColormap(["#d62728", "#2ca02c"])
         ax.pcolormesh(
-            np.arange(len(time_axis) + 1),
+            time_edges,
             np.arange(3),
             grid,
             cmap=cmap,
@@ -1051,12 +1401,12 @@ class CTM_OR_Model:
         )
         ax.set_yticks([0.5, 1.5])
         ax.set_yticklabels(["EW", "NS"])
-        tick_step = max(1, len(time_axis) // 10)
-        tick_positions = np.arange(0, len(time_axis) + 1, tick_step)
+        tick_step = max(1, num_phases // 10)
+        tick_positions = time_edges[::tick_step]
         ax.set_xticks(tick_positions)
-        ax.set_xlabel("Time step")
+        ax.set_xlabel("Time (s)")
         ax.set_title("Signal state grid (red/green)", fontweight="bold")
-        ax.set_xlim(0, len(time_axis))
+        ax.set_xlim(time_edges[0], time_edges[-1])
         ax.set_ylim(0, 2)
         ax.set_aspect("auto")
         ax.legend(
@@ -1081,7 +1431,7 @@ class CTM_OR_Model:
             return
 
         north_up_rho = self.rho_optimized[0, 0, -1, :]
-        time_steps = np.arange(self.num_steps + 1)
+        time_seconds = np.arange(self.num_steps + 1) * self.time_step_s
 
         fig, ax = plt.subplots(1, 1, figsize=(12, 6))
         fig.suptitle(
@@ -1089,10 +1439,10 @@ class CTM_OR_Model:
             fontsize=16,
             fontweight="bold",
         )
-        ax.plot(time_steps, north_up_rho, "b-", linewidth=2, alpha=0.8)
+        ax.plot(time_seconds, north_up_rho, "b-", linewidth=2, alpha=0.8)
         avg_rho = np.mean(north_up_rho)
         ax.axhline(y=avg_rho, color="r", linestyle="--", linewidth=1.5, label=f"Avg {avg_rho:.4f}")
-        ax.set_xlabel("Time step")
+        ax.set_xlabel("Time (s)")
         ax.set_ylabel("Density")
         ax.set_title("North - upstream last cell", fontweight="bold")
         ax.legend()
@@ -1126,15 +1476,16 @@ class CTM_OR_Model:
             rho_down_first_original = rho_original[:, dir_idx, 1, 0]
             rho_down_first_optimized = self.rho_optimized[dir_idx, 1, 0, :]
 
-            time_original = np.arange(len(rho_original))
-            time_optimized = np.arange(self.num_steps + 1)
+            original_dt = getattr(original_ctm, "time_step_s", self.time_step_s)
+            time_original = np.arange(len(rho_original)) * original_dt
+            time_optimized = np.arange(self.num_steps + 1) * self.time_step_s
 
             ax.plot(time_original, rho_up_last_original, "b-", linewidth=2, label="Original upstream")
             ax.plot(time_optimized, rho_up_last_optimized, "b--", linewidth=2, label="Optimized upstream")
             ax.plot(time_original, rho_down_first_original, "r-", linewidth=2, label="Original downstream")
             ax.plot(time_optimized, rho_down_first_optimized, "r--", linewidth=2, label="Optimized downstream")
 
-            ax.set_xlabel("Time step")
+            ax.set_xlabel("Time (s)")
             ax.set_ylabel("Density")
             ax.set_title(direction_names[dir_idx], fontweight="bold")
             ax.legend()
@@ -1200,7 +1551,7 @@ class CTM_OR_Model:
             ax.set_title(f"Intersection {inter} signal phases", fontweight="bold")
             ax.set_yticks([0, 1])
             ax.set_yticklabels(["Red", "Green"])
-            ax.set_xlim(0, len(time_axis) - 1)
+            ax.set_xlim(0, time_axis[-1])
             ax.grid(True, alpha=0.3)
             ax.legend()
 
@@ -1211,10 +1562,11 @@ class CTM_OR_Model:
             plt.show()
 
         if self.signal_phase:
-            print("Signal states by time step:")
+            print("Signal states by time (s):")
             for t, phase in enumerate(self.signal_phase):
                 state = "EW green" if phase < 0.5 else "NS green"
-                print(f"  t={t}: {state}")
+                t_s = t * self.time_step_s
+                print(f"  t={t_s:.2f}s: {state}")
 
 @dataclass(frozen=True)
 class LinkDef:
@@ -1247,13 +1599,19 @@ class CTM_OR_Network_Model:
         w=0.5,
         rho_jam=1.0,
         num_steps=360,
+        total_time_s=None,
         cell_length_m=100.0 / 3.0,
         cell_width_m=15.0,
         intersection_size_m=30.0,
         time_step_s=2.0,
+        min_green_s=5.0,
+        max_green_s=40.0,
         v_mps=50.0 / 3.0,
         w_mps=None,
         use_physical_units=True,
+        boundary_flows=None,
+        boundary_flow_unit="per_second",
+        startup_duration_s=None,
         grid_shape=None,
     ):
         self.num_intersections = num_intersections
@@ -1281,11 +1639,18 @@ class CTM_OR_Network_Model:
 
         self.rho_jam = rho_jam
         self.num_steps = num_steps
+        if total_time_s is not None:
+            self.num_steps = max(1, int(round(float(total_time_s) / time_step_s)))
+        self.total_time_s = self.num_steps * time_step_s
 
         self.cell_length_m = cell_length_m
         self.cell_width_m = cell_width_m
         self.intersection_size_m = intersection_size_m
         self.time_step_s = time_step_s
+        self.min_green_s = min_green_s
+        self.max_green_s = max_green_s
+        self.boundary_flow_unit = boundary_flow_unit
+        self.startup_duration_s = 6.0 if startup_duration_s is None else float(startup_duration_s)
 
         if use_physical_units:
             if v_mps is None:
@@ -1315,13 +1680,16 @@ class CTM_OR_Network_Model:
                 [0.6, 0.15, 0.25],
             ]
         )
+        self._validate_turning_ratios()
 
-        self.boundary_flows = {
-            "N": 0.26,
-            "E": 0.28,
-            "S": 0.22,
-            "W": 0.30,
-        }
+        if boundary_flows is None:
+            boundary_flows = {
+                "N": 0.26,
+                "E": 0.28,
+                "S": 0.22,
+                "W": 0.30,
+            }
+        self.boundary_flows = boundary_flows
 
         self.turn_map = {
             "N": {"S": "S", "L": "W", "R": "E"},
@@ -1371,14 +1739,21 @@ class CTM_OR_Network_Model:
             )
         )
         print(
-            "Intersections: {}, links: {}, internal cells: {}, external cells: {}, time steps: {}".format(
+            "Intersections: {}, links: {}, internal cells: {}, external cells: {}, "
+            "time steps: {} (dt={:.2f} s, total={:.2f} s)".format(
                 self.num_intersections,
                 len(self.links),
                 self.internal_cell_count,
                 self.external_cell_count,
                 self.num_steps,
+                self.time_step_s,
+                self.total_time_s,
             )
         )
+        if self.v > 1.0 + 1e-9 or self.w > 1.0 + 1e-9:
+            print(
+                "Warning: v or w exceeds 1 cell/step; large time_step_s may violate CFL."
+            )
 
     def _add_link(self, length, tail, head, tail_dir, head_dir):
         link_id = len(self.links)
@@ -1441,8 +1816,10 @@ class CTM_OR_Network_Model:
 
     def _boundary_flow(self, intersection, direction):
         if (intersection, direction) in self.boundary_flows:
-            return self.boundary_flows[(intersection, direction)]
-        return self.boundary_flows[direction]
+            rate = self.boundary_flows[(intersection, direction)]
+        else:
+            rate = self.boundary_flows[direction]
+        return self._boundary_demand_per_step(rate)
 
     def define_decision_variables(self):
         print("Defining decision variables...")
@@ -1543,6 +1920,7 @@ class CTM_OR_Network_Model:
         green_start = {}
         startup_step = {}
         startup_factor = {}
+        step_count = self._startup_step_count()
         for inter in self.intersections:
             for group in self.SIGNAL_GROUPS:
                 for t in range(self.num_steps + 1):
@@ -1552,7 +1930,7 @@ class CTM_OR_Network_Model:
                     startup_factor[(inter, group, t)] = self.model.addVar(
                         name=f"startup_factor_{inter}_{group}_{t}", vtype="C", lb=0.0, ub=1.0
                     )
-                    for step in range(1, 5):
+                    for step in range(1, step_count + 1):
                         startup_step[(inter, group, t, step)] = self.model.addVar(
                             name=f"startup_step_{inter}_{group}_{step}_{t}", vtype="B"
                         )
@@ -1574,6 +1952,52 @@ class CTM_OR_Network_Model:
 
     def _startup_profile(self):
         return self.STARTUP_PROFILE
+
+    def _startup_profile_steps(self):
+        base_profile = list(self.STARTUP_PROFILE)
+        if self.startup_duration_s is None:
+            return base_profile
+        transient_steps = max(1, int(math.ceil(self.startup_duration_s / self.time_step_s)))
+        base_transient = np.asarray(base_profile[:-1], dtype=float)
+        if transient_steps == len(base_transient):
+            transient_profile = base_transient
+        else:
+            x_old = np.linspace(1.0, len(base_transient), num=len(base_transient))
+            x_new = np.linspace(1.0, len(base_transient), num=transient_steps)
+            transient_profile = np.interp(x_new, x_old, base_transient)
+        return list(transient_profile) + [float(base_profile[-1])]
+
+    def _startup_step_count(self):
+        return len(self._startup_profile_steps())
+
+    def _boundary_demand_per_step(self, rate):
+        if self.boundary_flow_unit == "per_second":
+            return rate * self.time_step_s
+        if self.boundary_flow_unit == "per_step":
+            return rate
+        raise ValueError(f"Unsupported boundary_flow_unit: {self.boundary_flow_unit}")
+
+    def _turning_ratio(self, from_dir, movement):
+        dir_idx = self.DIRECTION_INDEX[from_dir]
+        move_idx = self.MOVEMENT_INDEX[movement]
+        return float(self.turning_ratios[dir_idx, move_idx])
+
+    def _validate_turning_ratios(self):
+        expected_shape = (len(self.DIRECTIONS), len(self.MOVEMENTS))
+        ratios = np.asarray(self.turning_ratios, dtype=float)
+        if ratios.shape != expected_shape:
+            raise ValueError(
+                f"turning_ratios must have shape {expected_shape}, got {ratios.shape}."
+            )
+        if np.any(ratios < -1e-9):
+            raise ValueError("turning_ratios must be non-negative for all movements.")
+        row_sums = ratios.sum(axis=1)
+        if not np.allclose(row_sums, 1.0, atol=1e-8):
+            raise ValueError(
+                "Each approach turning ratio row must sum to 1.0. "
+                f"Current row sums: {row_sums.tolist()}"
+            )
+        self.turning_ratios = ratios
 
     def _force_flow_min(
         self, flow_var, send_cap, recv_cap, max_cap, name_prefix, max_cap_value=None
@@ -2162,7 +2586,17 @@ class CTM_OR_Network_Model:
         green_start = self.decision_vars["green_start"]
         startup_step = self.decision_vars["startup_step"]
         startup_factor = self.decision_vars["startup_factor"]
-        profile = self._startup_profile()
+        profile = self._startup_profile_steps()
+        step_count = len(profile)
+
+        min_green_steps = max(1, int(math.ceil(self.min_green_s / self.time_step_s)))
+        max_green_steps = max(
+            min_green_steps, int(math.floor(self.max_green_s / self.time_step_s))
+        )
+        if min_green_steps > self.num_steps + 1:
+            raise ValueError(
+                "min_green_s is larger than the available time horizon."
+            )
 
         for inter in self.intersections:
             self.model.addCons(
@@ -2241,76 +2675,97 @@ class CTM_OR_Network_Model:
                         )
                         constraint_counter += 3
 
-                    step1 = startup_step[(inter, group, t, 1)]
-                    step2 = startup_step[(inter, group, t, 2)]
-                    step3 = startup_step[(inter, group, t, 3)]
-                    step4 = startup_step[(inter, group, t, 4)]
+                    step_vars = [
+                        startup_step[(inter, group, t, step)]
+                        for step in range(1, step_count + 1)
+                    ]
 
                     self.model.addCons(
-                        step1 == start_var,
+                        step_vars[0] == start_var,
                         name=f"startup_step1_{inter}_{group}_{constraint_counter}",
                     )
                     constraint_counter += 1
 
-                    if t >= 1:
-                        prev_start = green_start[(inter, group, t - 1)]
-                        self.model.addCons(
-                            step2 <= prev_start,
-                            name=f"startup_step2_ub1_{inter}_{group}_{constraint_counter}",
-                        )
-                        self.model.addCons(
-                            step2 <= green_now,
-                            name=f"startup_step2_ub2_{inter}_{group}_{constraint_counter}",
-                        )
-                        self.model.addCons(
-                            step2 >= prev_start + green_now - 1,
-                            name=f"startup_step2_lb_{inter}_{group}_{constraint_counter}",
-                        )
-                        constraint_counter += 3
-                    else:
-                        self.model.addCons(
-                            step2 == 0,
-                            name=f"startup_step2_zero_{inter}_{group}_{constraint_counter}",
-                        )
-                        constraint_counter += 1
-
-                    if t >= 2:
-                        prev2_start = green_start[(inter, group, t - 2)]
-                        self.model.addCons(
-                            step3 <= prev2_start,
-                            name=f"startup_step3_ub1_{inter}_{group}_{constraint_counter}",
-                        )
-                        self.model.addCons(
-                            step3 <= green_now,
-                            name=f"startup_step3_ub2_{inter}_{group}_{constraint_counter}",
-                        )
-                        self.model.addCons(
-                            step3 >= prev2_start + green_now - 1,
-                            name=f"startup_step3_lb_{inter}_{group}_{constraint_counter}",
-                        )
-                        constraint_counter += 3
-                    else:
-                        self.model.addCons(
-                            step3 == 0,
-                            name=f"startup_step3_zero_{inter}_{group}_{constraint_counter}",
-                        )
-                        constraint_counter += 1
+                    for step_idx in range(2, step_count):
+                        step_var = step_vars[step_idx - 1]
+                        offset = step_idx - 1
+                        if t >= offset:
+                            prev_start = green_start[(inter, group, t - offset)]
+                            self.model.addCons(
+                                step_var <= prev_start,
+                                name=f"startup_step{step_idx}_ub1_{inter}_{group}_{constraint_counter}",
+                            )
+                            self.model.addCons(
+                                step_var <= green_now,
+                                name=f"startup_step{step_idx}_ub2_{inter}_{group}_{constraint_counter}",
+                            )
+                            self.model.addCons(
+                                step_var >= prev_start + green_now - 1,
+                                name=f"startup_step{step_idx}_lb_{inter}_{group}_{constraint_counter}",
+                            )
+                            constraint_counter += 3
+                        else:
+                            self.model.addCons(
+                                step_var == 0,
+                                name=f"startup_step{step_idx}_zero_{inter}_{group}_{constraint_counter}",
+                            )
+                            constraint_counter += 1
 
                     self.model.addCons(
-                        step1 + step2 + step3 + step4 == green_now,
+                        quicksum(step_vars) == green_now,
                         name=f"startup_step_sum_{inter}_{group}_{constraint_counter}",
                     )
                     constraint_counter += 1
 
                     self.model.addCons(
                         startup_factor[(inter, group, t)]
-                        == profile[0] * step1
-                        + profile[1] * step2
-                        + profile[2] * step3
-                        + profile[3] * step4,
+                        == quicksum(
+                            profile[idx] * step_vars[idx] for idx in range(step_count)
+                        ),
                         name=f"startup_factor_{inter}_{group}_{constraint_counter}",
                     )
                     constraint_counter += 1
+
+            def _green_at(group, t):
+                return (
+                    1 - current_phase[(inter, t)]
+                    if group == "EW"
+                    else current_phase[(inter, t)]
+                )
+
+            max_start = self.num_steps - min_green_steps + 1
+            for t in range(max_start + 1):
+                for group in self.SIGNAL_GROUPS:
+                    window = quicksum(
+                        _green_at(group, t + k) for k in range(min_green_steps)
+                    )
+                    self.model.addCons(
+                        window >= min_green_steps * green_start[(inter, group, t)],
+                        name=f"min_green_{inter}_{group}_{constraint_counter}",
+                    )
+                    constraint_counter += 1
+
+            if max_start + 1 <= self.num_steps:
+                for t in range(max_start + 1, self.num_steps + 1):
+                    for group in self.SIGNAL_GROUPS:
+                        self.model.addCons(
+                            green_start[(inter, group, t)] == 0,
+                            name=f"min_green_tail_{inter}_{group}_{constraint_counter}",
+                        )
+                        constraint_counter += 1
+
+            max_window_start = self.num_steps - max_green_steps
+            if max_window_start >= 0:
+                for t in range(max_window_start + 1):
+                    for group in self.SIGNAL_GROUPS:
+                        window = quicksum(
+                            _green_at(group, t + k) for k in range(max_green_steps + 1)
+                        )
+                        self.model.addCons(
+                            window <= max_green_steps,
+                            name=f"max_green_{inter}_{group}_{constraint_counter}",
+                        )
+                        constraint_counter += 1
 
             for t in range(self.num_steps):
                 for from_dir in self.DIRECTIONS:
@@ -2331,6 +2786,19 @@ class CTM_OR_Network_Model:
                         flow[(inter, from_dir, self.turn_map[from_dir][movement], movement, t)]
                         for movement in self.MOVEMENTS
                     )
+
+                    for movement in self.MOVEMENTS:
+                        to_dir = self.turn_map[from_dir][movement]
+                        ratio = self._turning_ratio(from_dir, movement)
+                        self.model.addCons(
+                            flow[(inter, from_dir, to_dir, movement, t)]
+                            == ratio * total_outflow,
+                            name=(
+                                f"turning_ratio_{inter}_{from_dir}_{movement}_{t}_"
+                                f"{constraint_counter}"
+                            ),
+                        )
+                        constraint_counter += 1
 
                     self.model.addCons(
                         total_outflow <= self.v_crossing * cell_rho,
@@ -2435,6 +2903,9 @@ class CTM_OR_Network_Model:
         improve_rel=None,
         improve_chunk_seconds=30,
         improve_max_rounds=10,
+        log_path=None,
+        log_csv_path=None,
+        log_display_freq=1,
     ):
         import time
 
@@ -2442,8 +2913,28 @@ class CTM_OR_Network_Model:
         if self.model is None:
             raise ValueError("Model is not initialized. Call build_objective() first.")
 
+        if log_path is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            log_path = os.path.join(script_dir, "scip.log")
+        if log_csv_path is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            log_csv_path = os.path.join(script_dir, "scip_log.csv")
+
+        _reset_log_files(log_path, log_csv_path)
+
         if gap_rel is not None:
             self.model.setParam("limits/gap", gap_rel)
+
+        if log_path:
+            try:
+                self.model.setLogfile(log_path)
+            except Exception as exc:
+                print(f"Warning: failed to set log file ({exc}).")
+            if log_display_freq is not None:
+                try:
+                    self.model.setParam("display/freq", int(log_display_freq))
+                except Exception as exc:
+                    print(f"Warning: failed to set display/freq ({exc}).")
 
         if improve_chunk_seconds is not None and improve_max_rounds is not None:
             total_time = improve_chunk_seconds * improve_max_rounds
@@ -2467,6 +2958,15 @@ class CTM_OR_Network_Model:
         start_time = time.time()
         self.model.optimize()
         solve_time = time.time() - start_time
+
+        if log_csv_path and log_path:
+            if os.path.exists(log_path):
+                try:
+                    save_scip_log_csv(log_path, log_csv_path)
+                except Exception as exc:
+                    print(f"Warning: failed to parse log ({exc}).")
+            else:
+                print(f"Warning: log file not found after solve: {log_path}")
 
         status = self.model.getStatus()
         if self.model.getNSols() == 0:
@@ -2632,19 +3132,19 @@ class CTM_OR_Network_Model:
             phases = self.signal_phase.get(inter)
             if not phases:
                 continue
-            time_axis = np.arange(len(phases))
+            time_axis = np.arange(len(phases)) * self.time_step_s
             ew_signal = [1 - p for p in phases]
             ns_signal = [p for p in phases]
             ax = axes[idx]
             inter_tag = self._intersection_tag(inter)
             ax.step(time_axis, ew_signal, "b-", linewidth=2, where="post", label="EW green")
             ax.step(time_axis, ns_signal, "r-", linewidth=2, where="post", label="NS green")
-            ax.set_xlabel("Time step")
+            ax.set_xlabel("Time (s)")
             ax.set_ylabel("Signal state")
             ax.set_title(f"Intersection {inter_tag} signal phases", fontweight="bold")
             ax.set_yticks([0, 1])
             ax.set_yticklabels(["Red", "Green"])
-            ax.set_xlim(0, len(time_axis) - 1)
+            ax.set_xlim(0, time_axis[-1])
             ax.grid(True, alpha=0.3)
             ax.legend()
 
@@ -2690,8 +3190,9 @@ class CTM_OR_Network_Model:
                 cmap="viridis",
                 vmin=0.0,
                 vmax=self.rho_jam,
+                extent=(0, self.num_steps * self.time_step_s, 0, end - start),
             )
-            ax.set_xlabel("Time step")
+            ax.set_xlabel("Time (s)")
             ax.set_ylabel("Cell id")
             ax.set_title(f"Density evolution (cells {cell_start}-{cell_end})")
             ax.set_yticks(np.arange(end - start))
@@ -2713,6 +3214,13 @@ class CTM_OR_Network_Model:
 def main():
     print("=== CTM OR optimization demo (four intersections, 2x2 grid) ===")
 
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(script_dir, "scip.log")
+    log_csv_path = os.path.join(script_dir, "scip_log.csv")
+
+    total_time_s = 200.0
+    time_step_s = 5.0
+
     ctm_or = CTM_OR_Network_Model(
         num_intersections=4,
         grid_shape=(2, 2),
@@ -2721,7 +3229,8 @@ def main():
         v=1.0,
         w=0.5,
         rho_jam=1.0,
-        num_steps=100,
+        total_time_s=total_time_s,
+        time_step_s=time_step_s,
     )
 
     ctm_or.define_decision_variables()
@@ -2730,23 +3239,22 @@ def main():
     ctm_or.add_initial_conditions()
     ctm_or.print_initial_densities_for_direction(0, "W")
 
-    improve_rel = 0.00001
-    improve_chunk_seconds = 300
+    improve_rel = 0.0005
+    improve_chunk_seconds = 30
     improve_max_rounds = 10
     ctm_or.solve(
         improve_rel=improve_rel,
         improve_chunk_seconds=improve_chunk_seconds,
         improve_max_rounds=improve_max_rounds,
+        log_path=log_path,
+        log_csv_path=log_csv_path,
     )
 
     ctm_or.print_optimization_summary()
-
-    import os
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
     save_path = os.path.join(script_dir, "CTM_OR_results")
     ctm_or.plot_signal_phases(save_path=save_path)
     ctm_or.plot_all_cell_densities(save_path=save_path, max_plots=2)
+    plot_csv_series(log_csv_path, x_col="time_s", y_col="gap_rel")
 
     print("CTM OR optimization demo finished.")
 
