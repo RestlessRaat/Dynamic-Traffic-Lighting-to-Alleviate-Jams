@@ -24,3 +24,8 @@ OR模型问题：
 2026/1/27
 调整单元格密度-时间图表中标识问题
 优化初始密度分配规则，让密度更加平滑
+
+2026/02/10
+Some updates in the recent 2 weeks:
+Add the turning ratio into hard constraints (I dont know why I forget to do this), the density of cell 1-40 wont be zero density anymore
+Switch the basic unit of time from time step to second, and add the option to freely adjust the conversion relationship of such two arguments
